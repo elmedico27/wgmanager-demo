@@ -1,0 +1,210 @@
+// In-browser stand-in for the Express backend (preview and `npm run dev` only).
+// It mirrors the HTTP API the real backend will expose (see src/lib/api.js),
+// passing helper envelopes through unchanged, and adds the app-level states the
+// backend owns: login, first run (helper unreachable), SSH timeout.
+
+import { run, scenarios as helperScenarios, snapshot, restore } from './helper.js';
+import qrcode from 'qrcode-generator';
+
+// As in the real backend: UTF-8, not the library's 8-bit truncation.
+qrcode.stringToBytes = (s) => Array.from(new TextEncoder().encode(s));
+
+export const appScenarios = {
+  firstRun: false,    // app key not yet installed on the host: SSH is refused
+                      // (the preview also clears the host-key pin when this is turned on)
+  sshTimeout: false,  // next mutation hits the 60 s SSH timeout (outcome unknown)
+  noPassword: false,  // fresh install: no admin password yet, setup code in the log
+  hostKeyPinned: true,    // server's SSH host key confirmed by the admin
+  hostKeyChanged: false,  // the server now presents a different host key than the pinned one
+  serverOffline: false,   // SSH to the host fails (server down, rebooting)
+  sessionExpired: false,  // next request finds the session gone
+};
+
+// Unacknowledged failure warnings, as the backend keeps them in failures.json.
+let failures = [];
+
+// Fake ED25519 host-key fingerprints in OpenSSH's SHA256 format.
+const OFFERED_FP = 'SHA256:q3Vt8mK2pXw7LhN4bRz9cYdF1sJ6uE0aTgW5oQiHnBk';
+const OTHER_FP = 'SHA256:Zr1xY7cQ0vM3nB8kL5tW2pD9fH4sJ6gA1eU7iO3yRmT';
+let pinned = { fingerprint: OFFERED_FP, type: 'ED25519', at: Date.now() - 86400000 * 3 };
+
+// The real setup code is random and printed to the container log on start.
+export const PREVIEW_SETUP_CODE = 'K7QM-4XTD-92PW';
+export const MIN_PASSWORD = 12;
+
+export const scenarios = helperScenarios;
+
+let authenticated = false;
+const PREVIEW_PASSWORD_HINT = 'any password works in the preview';
+
+const settings = {
+  ssh: { host: '172.29.88.1', port: 22, user: 'wgweb' },
+  publicKey: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK7x2mQ9vR4tYw8pL3nHc6fJ1sB0aEdZuXgVqTyWiMoN wgmanager@container',
+  allowFrom: ['127.0.0.1', '::1', '172.29.88.0/29'],
+};
+
+const appError = (code, message) => ({ ok: false, error: { code, message } });
+
+// Demo build (`npm run build:demo`): keep the sign-in, clients and host-key
+// state across a refresh. sessionStorage belongs to one browser tab and is
+// cleared when the tab closes, so each new visit starts from the same data and
+// no visitor sees another's changes. Dev and the design preview stay in memory.
+const DEMO_KEY = 'wgm-demo';
+
+function loadDemo() {
+  try {
+    const s = JSON.parse(sessionStorage.getItem(DEMO_KEY) || 'null');
+    if (!s) return;
+    restore(s.helper);
+    authenticated = s.authenticated === true;
+    appScenarios.hostKeyPinned = s.hostKeyPinned !== false;
+    if (s.pinned) pinned = s.pinned;
+  } catch {
+    // storage blocked or unreadable: start clean
+  }
+}
+
+function saveDemo() {
+  try {
+    sessionStorage.setItem(
+      DEMO_KEY,
+      JSON.stringify({ helper: snapshot(), authenticated, hostKeyPinned: appScenarios.hostKeyPinned, pinned }),
+    );
+  } catch {
+    // storage blocked or full: the demo still works, it just forgets on refresh
+  }
+}
+
+if (__DEMO__) loadDemo();
+
+async function helper(request) {
+  // Order matters: the host key is checked before the app's key is offered.
+  if (appScenarios.hostKeyChanged) return appError('hostkey_changed', 'the server presented a different host key');
+  if (appScenarios.serverOffline) {
+    await new Promise((r) => setTimeout(r, 1500));
+    return appError('unreachable', 'the server did not answer on the SSH port');
+  }
+  if (!appScenarios.hostKeyPinned) return appError('hostkey_unconfirmed', 'confirm the server identity first');
+  if (appScenarios.firstRun) return appError('key_refused', "the server refused the app's key");
+  const { body } = await run(request);
+  return body;
+}
+
+export async function handle(method, path, body) {
+  const r = await route(method, path, body);
+  if (__DEMO__) saveDemo();
+  return r;
+}
+
+async function route(method, path, body) {
+  const m = path.match(/^\/api\/clients\/([^/]+)(?:\/(enable|disable|config))?$/);
+
+  if (path === '/api/setup' && method === 'POST') {
+    if (!appScenarios.noPassword) return appError('already_set', 'a password is already set');
+    if (body?.code?.trim().toUpperCase() !== PREVIEW_SETUP_CODE) return appError('bad_code', 'wrong setup code');
+    if (!body?.password || body.password.length < MIN_PASSWORD) return appError('weak_password', 'too short');
+    appScenarios.noPassword = false;
+    authenticated = true;
+    return { ok: true, data: { authenticated } };
+  }
+
+  if (path === '/api/session') {
+    if (method === 'GET') {
+      return { ok: true, data: { authenticated: authenticated && !appScenarios.noPassword, passwordSet: !appScenarios.noPassword, hint: PREVIEW_PASSWORD_HINT } };
+    }
+    if (method === 'POST') {
+      if (appScenarios.noPassword) return appError('no_password', 'no password is set; use the setup code');
+      if (!body?.password) return appError('bad_login', 'wrong password');
+      authenticated = true;
+      appScenarios.sessionExpired = false;
+      return { ok: true, data: { authenticated } };
+    }
+    if (method === 'DELETE') {
+      authenticated = false;
+      return { ok: true, data: { authenticated } };
+    }
+  }
+  if (appScenarios.sessionExpired) authenticated = false;
+  if (!authenticated) return appError('unauthenticated', 'sign in first');
+
+  if (path === '/api/settings') return { ok: true, data: settings };
+  if (path === '/api/hostkey') {
+    const offered = appScenarios.hostKeyChanged ? OTHER_FP : OFFERED_FP;
+    if (method === 'GET') {
+      return { ok: true, data: { pinned: appScenarios.hostKeyPinned ? pinned : null, offered: { fingerprint: offered, type: 'ED25519' } } };
+    }
+    if (method === 'POST') {
+      if (body?.fingerprint !== offered) return appError('hostkey_mismatch', 'the server key changed while confirming');
+      pinned = { fingerprint: offered, type: 'ED25519', at: Date.now() };
+      appScenarios.hostKeyPinned = true;
+      appScenarios.hostKeyChanged = false;
+      appScenarios.firstRun = false; // preview only: assume the install command was run
+      return { ok: true, data: { pinned } };
+    }
+    if (method === 'DELETE') {
+      appScenarios.hostKeyPinned = false;
+      return { ok: true, data: { pinned: null } };
+    }
+  }
+  if (path === '/api/password' && method === 'POST') {
+    // Preview: any non-empty current password is accepted.
+    if (!body?.current) return appError('bad_login', 'current password is wrong');
+    if (!body?.password || body.password.length < MIN_PASSWORD) return appError('weak_password', 'too short');
+    return { ok: true, data: { changed: true, otherSessionsSignedOut: true } };
+  }
+  if (path === '/api/failures' && method === 'GET') return { ok: true, data: { failures } };
+  const fm = path.match(/^\/api\/failures\/(.+)$/);
+  if (fm && method === 'DELETE') {
+    failures = failures.filter((f) => f.id !== decodeURIComponent(fm[1]));
+    return { ok: true, data: { acknowledged: fm[1] } };
+  }
+  if (path === '/api/version') return helper('version');
+  if (path === '/api/clients' && method === 'GET') return helper('list');
+  if (path === '/api/clients' && method === 'POST') return mutation(`add ${body.name}`);
+
+  if (m) {
+    const name = decodeURIComponent(m[1]);
+    if (method === 'DELETE' && !m[2]) return mutation(`remove ${name}`);
+    if (method === 'POST' && (m[2] === 'enable' || m[2] === 'disable')) return mutation(`${m[2]} ${name}`);
+    if (method === 'GET' && m[2] === 'config') return helper(`get-config ${name}`);
+  }
+  return appError('not_found', 'no such route');
+}
+
+async function mutation(request) {
+  let body;
+  if (appScenarios.sshTimeout && !appScenarios.firstRun) {
+    appScenarios.sshTimeout = false;
+    // The real helper may still finish; the app never retries.
+    run(request);
+    await new Promise((r) => setTimeout(r, 2500));
+    body = appError('timeout', 'no answer from the host within 60 seconds');
+  } else {
+    body = await helper(request);
+  }
+  // Like the backend: exit 5 and timeouts become warnings every browser sees.
+  if (!body.ok && (body.error.code === 'backend_failed' || body.error.code === 'timeout')) {
+    const [action, client] = request.split(' ');
+    failures = [...failures, { id: `f${Date.now()}`, action, client, at: Date.now(), error: body.error }];
+  }
+  return body;
+}
+
+/** QR for a client config, rendered as SVG. The real backend serves
+ *  /api/clients/:name/qrcode.svg; here we build an object URL. */
+export async function download(name) {
+  const res = await helper(`get-config ${name}`);
+  if (!res.ok) return res;
+  return { ok: true, blob: new Blob([res.data.config], { type: 'text/plain' }) };
+}
+
+export async function qr(name) {
+  const res = await helper(`get-config ${name}`);
+  if (!res.ok) return res;
+  // Same library and settings as the real backend.
+  const qr = qrcode(0, 'M');
+  qr.addData(res.data.config, 'Byte');
+  qr.make();
+  const svg = qr.createSvgTag({ cellSize: 4, margin: 16, scalable: true });
+  return { ok: true, url: URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' })) };
+}
